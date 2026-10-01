@@ -38,5 +38,5 @@ def test_job_claim_complete_and_deduplicate(client):
         assert first["id"] == second["id"]
         claimed = service.claim("worker-1")
         assert claimed and claimed["status"] == "running"
-        completed = service.complete(claimed["id"], "worker-1", {"count": 3})
+        completed = service.complete(claimed["id"], "worker-1", claimed["lease_token"], {"count": 3})
         assert completed["status"] == "completed"

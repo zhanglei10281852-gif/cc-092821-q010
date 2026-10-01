@@ -243,6 +243,57 @@ class ViabilityService:
         )
         return int(cursor.rowcount)
 
+    def generate_retest_reminders(self, due_before: date, *, limit: int = 500) -> dict[str, Any]:
+        """把到期复检日程标记为已通知并写入事件箱，全部在调用方事务内完成。
+
+        事件键按日程确定（retest-reminder:{schedule_id}），作业重试或接管后
+        重复执行不会产生重复事件；日程状态与事件写入同生共死，崩溃不会留下
+        只完成一半的批次。
+        """
+        from app.services.outbox import OutboxService
+
+        rows = self.connection.execute(
+            "SELECT s.id AS schedule_id,s.due_on,s.reason,l.id AS lot_id,l.lot_no,a.accession_no,a.crop_name "
+            "FROM retest_schedules s JOIN seed_lots l ON l.id=s.lot_id JOIN accessions a ON a.id=l.accession_id "
+            "WHERE s.status='pending' AND s.due_on<=? ORDER BY s.due_on,s.id LIMIT ?",
+            (due_before.isoformat(), limit),
+        ).fetchall()
+        timestamp = to_storage(self.clock.now())
+        outbox = OutboxService(self.connection, self.clock)
+        marked: list[int] = []
+        event_keys: list[str] = []
+        skipped: list[int] = []
+        for row in rows:
+            cursor = self.connection.execute(
+                "UPDATE retest_schedules SET status='notified',updated_at=? WHERE id=? AND status='pending'",
+                (timestamp, row["schedule_id"]),
+            )
+            if cursor.rowcount != 1:
+                skipped.append(int(row["schedule_id"]))
+                continue
+            payload = {
+                "schedule_id": int(row["schedule_id"]),
+                "lot_id": int(row["lot_id"]),
+                "lot_no": row["lot_no"],
+                "accession_no": row["accession_no"],
+                "crop_name": row["crop_name"],
+                "due_on": row["due_on"],
+                "reason": row["reason"],
+            }
+            event = outbox.enqueue_event(
+                f"retest-reminder:{row['schedule_id']}", "viability.retest_reminder",
+                "seed_lot", row["lot_id"], payload,
+            )
+            marked.append(int(row["schedule_id"]))
+            event_keys.append(str(event["event_key"]))
+        return {
+            "due_before": due_before.isoformat(),
+            "reminder_count": len(marked),
+            "marked_schedule_ids": marked,
+            "event_keys": event_keys,
+            "skipped_schedule_ids": skipped,
+        }
+
     def _latest_counts(self, test_id: int) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             "SELECT c.* FROM viability_counts c JOIN (SELECT replicate_no,MAX(observation_day) AS day "

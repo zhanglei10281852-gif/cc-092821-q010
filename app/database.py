@@ -121,15 +121,33 @@ CREATE TABLE IF NOT EXISTS background_jobs (
     payload_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','completed','failed','cancelled')),
     attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 5,
     available_at TEXT NOT NULL,
     locked_at TEXT,
     locked_by TEXT,
+    lease_token TEXT,
+    lease_expires_at TEXT,
     result_json TEXT,
     error_message TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_ready ON background_jobs(status,available_at);
+CREATE TABLE IF NOT EXISTS job_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL REFERENCES background_jobs(id) ON DELETE CASCADE,
+    attempt_no INTEGER NOT NULL,
+    worker TEXT NOT NULL,
+    lease_token TEXT NOT NULL,
+    leased_at TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    finished_at TEXT,
+    outcome TEXT CHECK(outcome IN ('completed','retry','failed','expired')),
+    message TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(job_id,attempt_no)
+);
+CREATE INDEX IF NOT EXISTS idx_job_attempts_job ON job_attempts(job_id,id);
 
 CREATE TABLE IF NOT EXISTS collection_sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -382,16 +400,36 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     aggregate_type TEXT NOT NULL,
     aggregate_id TEXT NOT NULL,
     payload_json TEXT NOT NULL,
+    channel TEXT NOT NULL DEFAULT 'notification',
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','published','failed')),
     attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 8,
     available_at TEXT NOT NULL,
     locked_by TEXT,
     locked_at TEXT,
+    lease_token TEXT,
+    lease_expires_at TEXT,
     published_at TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_events(status,available_at,id);
+CREATE TABLE IF NOT EXISTS outbox_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES outbox_events(id) ON DELETE CASCADE,
+    event_key TEXT NOT NULL,
+    delivery_key TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    publisher TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL,
+    outcome TEXT NOT NULL CHECK(outcome IN ('delivered','duplicate','failed','replayed')),
+    message TEXT,
+    replay_of INTEGER REFERENCES outbox_deliveries(id),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_deliveries_event ON outbox_deliveries(event_id,id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deliveries_first_success
+    ON outbox_deliveries(event_key,channel) WHERE outcome='delivered' AND replay_of IS NULL;
 '''
 
 PERMISSIONS = [
@@ -402,7 +440,11 @@ PERMISSIONS = [
     ("departments.read", "查看部门", "departments", "read"),
     ("departments.write", "维护部门", "departments", "write"),
     ("audit.read", "查看审计", "audit", "read"),
+    ("jobs.read", "查看后台作业", "jobs", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
+    ("outbox.read", "查看事件箱", "outbox", "read"),
+    ("outbox.publish", "投递事件箱事件", "outbox", "publish"),
+    ("outbox.replay", "重放事件箱事件", "outbox", "replay"),
     ("accessions.read", "查看种质材料", "accessions", "read"),
     ("accessions.write", "维护种质材料", "accessions", "write"),
     ("inventory.read", "查看库存", "inventory", "read"),
@@ -468,10 +510,33 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _ensure_columns(connection: sqlite3.Connection) -> None:
+    """为既有数据库补齐租约与投递相关列，保证旧库可以平滑升级。"""
+    additions = {
+        "background_jobs": [
+            ("max_attempts", "INTEGER NOT NULL DEFAULT 5"),
+            ("lease_token", "TEXT"),
+            ("lease_expires_at", "TEXT"),
+        ],
+        "outbox_events": [
+            ("channel", "TEXT NOT NULL DEFAULT 'notification'"),
+            ("max_attempts", "INTEGER NOT NULL DEFAULT 8"),
+            ("lease_token", "TEXT"),
+            ("lease_expires_at", "TEXT"),
+        ],
+    }
+    for table, columns in additions.items():
+        existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+        for name, ddl in columns:
+            if name not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
 def init_db() -> None:
     timestamp = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _ensure_columns(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -498,7 +563,7 @@ def init_db() -> None:
             "registrar": ["accessions.read", "accessions.write", "inventory.read", "inventory.write"],
             "technician": ["accessions.read", "inventory.read", "viability.read", "viability.write"],
             "curator": ["accessions.read", "inventory.read", "viability.read", "quality.review", "distribution.approve"],
-            "auditor": ["accessions.read", "inventory.read", "viability.read", "audit.read"],
+            "auditor": ["accessions.read", "inventory.read", "viability.read", "audit.read", "jobs.read", "outbox.read"],
         }
         for role_code, codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]
