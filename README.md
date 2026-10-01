@@ -48,7 +48,29 @@ python -m app.cli demo
 - `app/germplasm/inventory.py` 管理批次、库位容量、容器摆放、移动、领用和冻结。
 - `app/germplasm/viability.py` 管理检测规程、取样、重复计数、活力结果与复检日程。
 - `app/germplasm/quality.py` 管理温湿度读数、偏离告警和种质发放审批。
+- `app/services/jobs.py` 提供后台作业的租约执行，`app/services/outbox.py` 提供事件箱投递，`app/services/reminders.py` 定义夜间复检提醒扫描作业。
 - `app/api`、`app/services` 和 `app/repositories` 提供身份、权限、审计、后台作业及维护能力。
+
+## 后台作业与事件投递
+
+复检提醒的夜间批量生成由 `retest.reminder.scan` 作业完成，按 `retest-reminder-scan:{日期}` 去重登记。作业执行满足以下恢复约定：
+
+- **事务边界**：领取作业自成一个事务并写入租约令牌与尝试记录（`job_attempts`）；复检日程变更、outbox 事件写入和完成回执在同一个事务提交，失败时整体回滚，不会出现"日程已标记但事件缺失"的中间状态。
+- **租约接管**：租约过期后其他执行者可接管（旧式无租约列的 running 记录按 `locked_at` 兜底回收）；完成/失败回执必须携带当前租约令牌，旧执行者的迟到回执会被拒绝，不会覆盖新结果。
+- **退避与人工处理**：失败按可注入时钟指数退避（`backoff_base_seconds` 起步、翻倍、封顶），达到 `max_attempts` 后进入人工处理（`failed` + `dead_lettered_at`），管理员确认后可重新排队（requeue）。
+- **事件发布**：发布端先租约一批 `pending` 事件，逐事件投递到待办信箱（`notification_messages` 按 `event_key` 去重，重复投递不产生重复通知），再同事务确认整批并推进 `publisher_checkpoints` 中的连续已投递游标。领取后、业务提交后或确认前中断，都会在租约过期后安全重放。事件超过尝试上限进入人工处理，管理员可重放单个事件（replay），只重新投递、不改变任何业务表。
+- **可观测**：`GET /api/system/jobs`、`/api/system/jobs/{id}`、`/api/system/outbox`、`/api/system/outbox/{id}`、`/api/system/notifications` 展示每次尝试、租约所有者、关联批次（lot）与最终投递结果；对应 CLI 为 `jobs-list`/`job-show`/`outbox-list`/`outbox-show`/`notifications-list`。
+
+常用运维命令：
+
+```bash
+python -m app.cli enqueue-reminder-scan --date 2026-10-01   # 登记当夜扫描作业（幂等）
+python -m app.cli jobs-run --worker nightly-1               # 领取并执行到期作业
+python -m app.cli outbox-publish --publisher ops-1          # 按游标发布一批事件
+python -m app.cli job-show 1                                # 查看尝试记录与结果
+python -m app.cli outbox-show 1                             # 查看投递尝试与最终结果
+python -m app.cli outbox-replay 1 --actor ops-admin         # 重放单个事件
+```
 
 ## 一致性约定
 

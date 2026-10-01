@@ -121,15 +121,34 @@ CREATE TABLE IF NOT EXISTS background_jobs (
     payload_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','completed','failed','cancelled')),
     attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 5,
     available_at TEXT NOT NULL,
     locked_at TEXT,
     locked_by TEXT,
+    lease_token TEXT,
+    lease_expires_at TEXT,
     result_json TEXT,
     error_message TEXT,
+    dead_lettered_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_ready ON background_jobs(status,available_at);
+CREATE TABLE IF NOT EXISTS job_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL REFERENCES background_jobs(id) ON DELETE CASCADE,
+    attempt_no INTEGER NOT NULL,
+    worker TEXT NOT NULL,
+    lease_token TEXT NOT NULL,
+    leased_at TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    finished_at TEXT,
+    outcome TEXT CHECK(outcome IN ('completed','failed','expired','dead_lettered')),
+    error_message TEXT,
+    result_json TEXT,
+    UNIQUE(job_id,attempt_no)
+);
+CREATE INDEX IF NOT EXISTS idx_job_attempts ON job_attempts(job_id,attempt_no);
 
 CREATE TABLE IF NOT EXISTS collection_sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -384,14 +403,51 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     payload_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','published','failed')),
     attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 8,
     available_at TEXT NOT NULL,
     locked_by TEXT,
     locked_at TEXT,
+    lease_token TEXT,
+    lease_expires_at TEXT,
     published_at TEXT,
     last_error TEXT,
+    delivery_json TEXT,
+    dead_lettered_at TEXT,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_events(status,available_at,id);
+CREATE TABLE IF NOT EXISTS outbox_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES outbox_events(id) ON DELETE CASCADE,
+    attempt_no INTEGER NOT NULL,
+    publisher TEXT NOT NULL,
+    lease_token TEXT NOT NULL,
+    leased_at TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    finished_at TEXT,
+    outcome TEXT CHECK(outcome IN ('published','failed','expired','dead_lettered','replayed')),
+    error_message TEXT,
+    delivery_json TEXT,
+    UNIQUE(event_id,attempt_no)
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_attempts ON outbox_attempts(event_id,attempt_no);
+CREATE TABLE IF NOT EXISTS notification_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    event_id INTEGER NOT NULL REFERENCES outbox_events(id) ON DELETE CASCADE,
+    channel TEXT NOT NULL DEFAULT 'todo',
+    recipient TEXT NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_recipient ON notification_messages(recipient,id);
+CREATE TABLE IF NOT EXISTS publisher_checkpoints (
+    channel TEXT PRIMARY KEY,
+    last_confirmed_id INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
 '''
 
 PERMISSIONS = [
@@ -402,6 +458,7 @@ PERMISSIONS = [
     ("departments.read", "查看部门", "departments", "read"),
     ("departments.write", "维护部门", "departments", "write"),
     ("audit.read", "查看审计", "audit", "read"),
+    ("jobs.read", "查看后台作业与事件", "jobs", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
     ("accessions.read", "查看种质材料", "accessions", "read"),
     ("accessions.write", "维护种质材料", "accessions", "write"),
@@ -411,6 +468,19 @@ PERMISSIONS = [
     ("viability.write", "执行活力检测", "viability", "write"),
     ("quality.review", "复核质量结果", "quality", "review"),
     ("distribution.approve", "审批种质发放", "distribution", "approve"),
+]
+
+
+COLUMN_MIGRATIONS = [
+    ("background_jobs", "max_attempts", "ALTER TABLE background_jobs ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 5"),
+    ("background_jobs", "lease_token", "ALTER TABLE background_jobs ADD COLUMN lease_token TEXT"),
+    ("background_jobs", "lease_expires_at", "ALTER TABLE background_jobs ADD COLUMN lease_expires_at TEXT"),
+    ("background_jobs", "dead_lettered_at", "ALTER TABLE background_jobs ADD COLUMN dead_lettered_at TEXT"),
+    ("outbox_events", "max_attempts", "ALTER TABLE outbox_events ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 8"),
+    ("outbox_events", "lease_token", "ALTER TABLE outbox_events ADD COLUMN lease_token TEXT"),
+    ("outbox_events", "lease_expires_at", "ALTER TABLE outbox_events ADD COLUMN lease_expires_at TEXT"),
+    ("outbox_events", "delivery_json", "ALTER TABLE outbox_events ADD COLUMN delivery_json TEXT"),
+    ("outbox_events", "dead_lettered_at", "ALTER TABLE outbox_events ADD COLUMN dead_lettered_at TEXT"),
 ]
 
 
@@ -446,8 +516,9 @@ def close_connection() -> None:
 
 
 @contextmanager
-def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
-    connection = get_connection()
+def transaction(connection: sqlite3.Connection | None = None, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+    if connection is None:
+        connection = get_connection()
     if connection.in_transaction:
         marker = f"nested_{id(object())}"
         connection.execute(f"SAVEPOINT {marker}")
@@ -468,10 +539,18 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _migrate_columns(connection: sqlite3.Connection) -> None:
+    for table, column, ddl in COLUMN_MIGRATIONS:
+        existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+        if existing and column not in existing:
+            connection.execute(ddl)
+
+
 def init_db() -> None:
     timestamp = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _migrate_columns(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -498,7 +577,7 @@ def init_db() -> None:
             "registrar": ["accessions.read", "accessions.write", "inventory.read", "inventory.write"],
             "technician": ["accessions.read", "inventory.read", "viability.read", "viability.write"],
             "curator": ["accessions.read", "inventory.read", "viability.read", "quality.review", "distribution.approve"],
-            "auditor": ["accessions.read", "inventory.read", "viability.read", "audit.read"],
+            "auditor": ["accessions.read", "inventory.read", "viability.read", "audit.read", "jobs.read"],
         }
         for role_code, codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]
